@@ -1,10 +1,7 @@
 package main
 
 import (
-	"database/sql"
-	"errors"
 	"fmt"
-	"time"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/skeema/tengo"
@@ -218,49 +215,33 @@ func (t *Target) verifyDiff(diff *tengo.SchemaDiff) (err error) {
 		return nil
 	}
 
-	// Populate the temp schema with a copy of the tables from SchemaFromInstance,
+	// Populate a workspace with a copy of the tables from SchemaFromInstance,
 	// the "before" state of the tables
-	tempSchemaName := t.Dir.Config.Get("temp-schema")
-
-	// TODO: want to skip binlogging for all temp schema actions, if super priv available
-	var tx *sql.Tx
-	if tx, err = t.lockTempSchema(30 * time.Second); err != nil {
+	var ws Workspace
+	ws, err = NewTempSchema(t.Dir.Config, t.Instance)
+	if err != nil {
 		return fmt.Errorf("verifyDiff: %s", err)
 	}
 	defer func() {
-		unlockErr := t.unlockTempSchema(tx)
-		if unlockErr != nil && err == nil {
-			err = fmt.Errorf("verifyDiff: %s", unlockErr)
+		cleanupErr := ws.Cleanup()
+		if cleanupErr != nil && err == nil {
+			err = cleanupErr
 		}
 	}()
 
-	if has, err := t.Instance.HasSchema(tempSchemaName); err != nil {
-		return err
-	} else if has {
-		// Attempt to drop any tables already present in tempSchema, but fail if
-		// any of them actually have 1 or more rows
-		if err := t.Instance.DropTablesInSchema(tempSchemaName, true); err != nil {
-			return fmt.Errorf("verifyDiff: cannot drop existing tables for %s on %s: %s", t.Dir, t.Instance, err)
-		}
-	} else {
-		_, err = t.Instance.CreateSchema(tempSchemaName, t.Dir.Config.Get("default-character-set"), t.Dir.Config.Get("default-collation"))
-		if err != nil {
-			return fmt.Errorf("verifyDiff: cannot create temporary schema for %s on %s: %s", t.Dir, t.Instance, err)
-		}
-	}
-
-	db, err := t.Instance.Connect(tempSchemaName, "")
+	wsInstance := ws.Instance()
+	db, err := wsInstance.Connect(ws.SchemaName(), "")
 	if err != nil {
-		return fmt.Errorf("verifyDiff: cannot connect to %s: %s", t.Instance, err)
+		return fmt.Errorf("verifyDiff: cannot connect to %s: %s", wsInstance, err)
 	}
 	mods := tengo.StatementModifiers{
 		NextAutoInc:            tengo.NextAutoIncIgnore,
 		StrictIndexOrder:       true, // needed since we must get the SHOW CREATE TABLEs to match
 		StrictForeignKeyNaming: true, // ditto
 		AllowUnsafe:            true, // needed since we're just running against the temp schema
-		Flavor:                 t.Instance.Flavor(),
+		Flavor:                 wsInstance.Flavor(),
 	}
-	if major, minor, _ := t.Instance.Version(); major != 5 || minor != 5 {
+	if major, minor, _ := wsInstance.Version(); major != 5 || minor != 5 {
 		// avoid having MySQL ignore index changes that are simply reordered, but only
 		// legal syntax in 5.6+
 		mods.AlgorithmClause = "COPY"
@@ -305,7 +286,7 @@ func (t *Target) verifyDiff(diff *tengo.SchemaDiff) (err error) {
 			}
 		}
 		expected, _ := tengo.ParseCreateAutoInc(v.To.CreateStatement)
-		actual, err := t.Instance.ShowCreateTable(tempSchemaName, v.To.Name)
+		actual, err := wsInstance.ShowCreateTable(ws.SchemaName(), v.To.Name)
 		if err != nil {
 			return err
 		}
@@ -323,47 +304,5 @@ func (t *Target) verifyDiff(diff *tengo.SchemaDiff) (err error) {
 		}
 	}
 
-	// Clean up the temp schema
-	if !t.Dir.Config.GetBool("reuse-temp-schema") {
-		if err = t.Instance.DropSchema(tempSchemaName, true); err != nil {
-			return fmt.Errorf("verifyDiff: cannot drop temporary schema for %s on %s: %s", t.Dir, t.Instance, err)
-		}
-	}
-
 	return nil
-}
-
-func (t *Target) lockTempSchema(maxWait time.Duration) (*sql.Tx, error) {
-	db, err := t.Instance.Connect("", "")
-	if err != nil {
-		return nil, err
-	}
-	tx, err := db.Begin()
-	if err != nil {
-		return nil, err
-	}
-
-	var getLockResult int
-	lockName := fmt.Sprintf("skeema.%s", t.Dir.Config.Get("temp-schema"))
-	start := time.Now()
-
-	for time.Since(start) < maxWait {
-		// Only using a timeout of 1 sec on each query to avoid potential issues with
-		// query killers, spurious slow query logging, etc
-		err := tx.QueryRow("SELECT GET_LOCK(?, 1)", lockName).Scan(&getLockResult)
-		if err == nil && getLockResult == 1 {
-			return tx, nil
-		}
-	}
-	return nil, errors.New("Unable to acquire lock")
-}
-
-func (t *Target) unlockTempSchema(tx *sql.Tx) error {
-	lockName := fmt.Sprintf("skeema.%s", t.Dir.Config.Get("temp-schema"))
-	var releaseLockResult int
-	err := tx.QueryRow("SELECT RELEASE_LOCK(?)", lockName).Scan(&releaseLockResult)
-	if err != nil || releaseLockResult != 1 {
-		return errors.New("Failed to release lock, or connection holding lock already dropped")
-	}
-	return tx.Rollback()
 }
